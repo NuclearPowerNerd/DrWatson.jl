@@ -50,6 +50,8 @@ See also [`collect_results`](@ref).
 * `black_list = [:gitcommit, :gitpatch, :script]`: List of keys not to include from result-file.
 * `special_list = []`: List of additional (derived) key-value pairs
   to put in `df` as explained below.
+* `custom_wload_wrapper`: Enable a customer wrapper around the calls to `wload` inside `collect_results!`. See `wload_wrapper`.
+* `wload_wrapper`: A custom wrapper around `wload`. By default this will throw an error if `custom_wload_wrapper` is true but the user does not pass a function via this kwarg. This can be used to ensure the result of `wload` is a `Dict` which is what `collect_results` expects. This is important if the result being loaded is a struct that contains all the simulation parameters. For example, one could do `wload_wrapper = (d) -> struct2dict(d["solution"])`.
 
 `special_list` is a `Vector` where each entry
 is a derived quantity to be included in `df`. There are two types of entries.
@@ -72,24 +74,28 @@ and then define
 In case this operation fails the values will be treated as `missing`.
 """
 collect_results!(folder; kwargs...) =
-collect_results!(
-joinpath(dirname(rstrip(folder, '/')), "results_$(rstrip(basename(folder), '/')).jld2"),
-folder; kwargs...)
+    collect_results!(
+        joinpath(dirname(rstrip(folder, '/')), "results_$(rstrip(basename(folder), '/')).jld2"),
+        folder; kwargs...)
 
 struct InvalidResultsCollection <: Exception
     msg::AbstractString
 end
- Base.showerror(io::IO, e::InvalidResultsCollection) = print(io, e.msg)
+Base.showerror(io::IO, e::InvalidResultsCollection) = print(io, e.msg)
+
+const wload_wrapper_error_message = "`custom_wload_wrapper` was set to true but no custom wrapper was provided via `wload_wrapper`. Please provide a custom wrapper."
 
 function collect_results!(filename, folder;
-    valid_filetypes = [".bson", "jld", ".jld2"],
-    subfolders = false,
-    rpath = nothing,
-    verbose = true,
-    update = false,
-    newfile = false, # keyword only for defining collect_results without !
-    rinclude = [r""],
-    rexclude = [r"^\b$"],
+    valid_filetypes=[".bson", "jld", ".jld2"],
+    subfolders=false,
+    rpath=nothing,
+    verbose=true,
+    update=false,
+    newfile=false, # keyword only for defining collect_results without !
+    rinclude=[r""],
+    rexclude=[r"^\b$"],
+    custom_wload_wrapper=false,
+    wload_wrapper=(args...; kwargs...) -> error(wload_wrapper_error_message),
     kwargs...)
 
     @assert all(eltype(r) <: Regex for r in (rinclude, rexclude)) "Elements of `rinclude` and `rexclude` must be Regex expressions."
@@ -100,7 +106,11 @@ function collect_results!(filename, folder;
         mtimes = Dict{String,Float64}()
     else
         verbose && @info "Loading existing result collection..."
-        data = wload(filename)
+        if custom_wload_wrapper
+            data = wload_wrapper(wload(filename))
+        else
+            data = wload(filename)
+        end
         df = data["df"]
         # Check if we have pre-recorded mtimes (if not this could be because of an old results database).
         if "mtime" ∈ keys(data)
@@ -118,7 +128,7 @@ function collect_results!(filename, folder;
         allfiles = String[]
         for (root, dirs, files) in walkdir(folder)
             for file in files
-                push!(allfiles, joinpath(root,file))
+                push!(allfiles, joinpath(root, file))
             end
         end
     else
@@ -140,7 +150,7 @@ function collect_results!(filename, folder;
 
     n = 0 # new entries added
     u = 0 # entries updated
-    existing_files = "path" in string.(names(df)) ? df[:,:path] : ()
+    existing_files = "path" in string.(names(df)) ? df[:, :path] : ()
     for file ∈ allfiles
         is_valid_file(file, valid_filetypes) || continue
         # maybe use relative path
@@ -168,14 +178,18 @@ function collect_results!(filename, folder;
 
         # Now update the mtime of the new or modified file
         mtimes[file] = mtime_file
-
         fpath = rpath === nothing ? file : joinpath(rpath, file)
-        df_new = to_data_row(FileIO.query(fpath); kwargs...)
+        df_new = to_data_row(
+            FileIO.query(fpath);
+            custom_wload_wrapper=custom_wload_wrapper,
+            wload_wrapper=wload_wrapper,
+            kwargs...
+        )
         #add filename
         df_new[!, :path] .= file
         if replace_entry
             # Delete the row with the old data
-            delete!(df, findfirst((x)->(x.path == file), eachrow(df)))
+            delete!(df, findfirst((x) -> (x.path == file), eachrow(df)))
             u += 1
         else
             n += 1
@@ -184,7 +198,7 @@ function collect_results!(filename, folder;
     end
     if update
         # Delete entries with nonexisting files.
-        idx = findall((x)->(!isfile(x.path)), eachrow(df))
+        idx = findall((x) -> (!isfile(x.path)), eachrow(df))
         deleteat!(df, idx)
         verbose && @info "Added $n entries. Updated $u entries. Deleted $(length(idx)) entries."
     else
@@ -221,9 +235,9 @@ function merge_dataframes!(df1, df2)
             df2[!, m] .= [missing]
         end
         for m ∈ setdiff(names(df2), names(df1))
-            DataFrames.insertcols!(df1, length(names(df1))+1, m => fill(missing, size(df1,1)))
+            DataFrames.insertcols!(df1, length(names(df1)) + 1, m => fill(missing, size(df1, 1)))
         end
-        return vcat(df1,df2)
+        return vcat(df1, df2)
     end
 end
 
@@ -231,26 +245,45 @@ is_valid_file(file, valid_filetypes) =
     any(endswith(file, v) for v in valid_filetypes)
 
 # Use wload per default when nothing else is available
-function to_data_row(file::File; kwargs...)
+function to_data_row(
+    file::File;
+    custom_wload_wrapper=false,
+    wload_wrapper=(args...; kwargs...) -> error(wload_wrapper_error_message),
+    kwargs...
+)
     fpath = filename(file)
     @debug "Opening $(filename(file)) with fallback wload."
-    return to_data_row(wload(fpath), fpath; kwargs...)
+    if custom_wload_wrapper
+        return to_data_row(wload_wrapper(wload(fpath)), fpath; kwargs...)
+    else
+        return to_data_row(wload(fpath), fpath; kwargs...)
+    end
+
 end
 # Specialize for JLD2 files, can do much faster mmapped access
-function to_data_row(file::File{format"JLD2"}; kwargs...)
+function to_data_row(
+    file::File{format"JLD2"};
+    custom_wload_wrapper=false,
+    wload_wrapper=(args...; kwargs...) -> error(wload_wrapper_error_message),
+    kwargs...
+)
     fpath = filename(file)
     @debug "Opening $(filename(file)) with jldopen."
     JLD2.jldopen(filename(file), "r") do data
-        return to_data_row(data, fpath; kwargs...)
+        if custom_wload_wrapper
+            return to_data_row(wload_wrapper(data), fpath; kwargs...)
+        else
+            return to_data_row(data, fpath; kwargs...)
+        end
     end
 end
 function to_data_row(data, file;
-        white_list = collect(keys(data)),
-        black_list = keytype(data).((:gitcommit, :gitpatch, :script)),
-        special_list = [])
+    white_list=collect(keys(data)),
+    black_list=keytype(data).((:gitcommit, :gitpatch, :script)),
+    special_list=[])
     cnames = setdiff!(white_list, black_list)
     entries = Pair{Symbol,Any}[]
-    append!(entries,Symbol.(cnames) .=> (x->[x]).(getindex.(Ref(data),cnames)))
+    append!(entries, Symbol.(cnames) .=> (x -> [x]).(getindex.(Ref(data), cnames)))
     #Add special things here
     for elem in special_list
         try
@@ -267,8 +300,8 @@ function to_data_row(data, file;
                 end
             end
         catch e
-            @warn "While applying $(string(elem)) to file "*
-            "$(file), got error $e."
+            @warn "While applying $(string(elem)) to file " *
+                  "$(file), got error $e."
         end
     end
     return DataFrames.DataFrame(entries...)
@@ -282,4 +315,4 @@ load (or later save) an existing dataframe. Thus all found results files
 are processed.
 """
 collect_results(folder; kwargs...) =
-collect_results!("", folder; newfile = true, kwargs...)
+    collect_results!("", folder; newfile=true, kwargs...)
